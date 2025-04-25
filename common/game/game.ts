@@ -1,4 +1,10 @@
-import { InformationOf, RoleId, ROLES, RoleSet } from "@common/game/roles.js";
+import {
+  Alignment,
+  InformationOf,
+  RoleId,
+  ROLES,
+  RoleSet,
+} from "@common/game/roles.js";
 
 /**
  * The type of a unique identifier for a user in the lobby
@@ -61,6 +67,14 @@ export type GamePhase =
   | "game_over";
 
 /**
+ * Describes the ways in which a game can finish
+ */
+export type GameResult =
+  | { reason: "vote_tracker"; winning_team: "evil" }
+  | { reason: "assassination_result"; winning_team: Alignment }
+  | { reason: "mission_result"; winning_team: Alignment };
+
+/**
  * Includes how many votes have failed in a row
  */
 export type WithVotesFailed<TPhase> =
@@ -81,6 +95,13 @@ export type WithCurrentTeam<TPhase> =
  */
 export type WithVotes<TPhase> = TPhase extends "round:mission_reveal"
   ? { votes: { success: number; fail: number } }
+  : unknown;
+
+/**
+ * Includes the result of the game
+ */
+export type WithGameResult<TPhase> = TPhase extends "game_over"
+  ? { result: GameResult }
   : unknown;
 
 /**
@@ -113,20 +134,26 @@ export type GameState = {
     /**
      * The results of missions so far
      */
-    missionResults: boolean[];
+    missionResults: Alignment[];
 
     /**
      * The current round of the game
      */
-    currentMission: number;
+    missionIndex: number;
 
     /**
      * The index of the current leader in the player list
      */
     leaderIndex: number;
+
+    /**
+     * The index of the current Lady of the Lake in the player list
+     */
+    ladyIndex: number;
   } & WithVotesFailed<TPhase> &
     WithCurrentTeam<TPhase> &
-    WithVotes<TPhase>;
+    WithVotes<TPhase> &
+    WithGameResult<TPhase>;
 }[GamePhase];
 
 /**
@@ -193,6 +220,7 @@ export type UserInputByPhase = {
   "round:team_select": UserId[];
   "round:team_vote": boolean;
   "round:mission": boolean;
+  "round:lady_choice": UserId;
   assassination: UserId;
 };
 
@@ -200,7 +228,7 @@ export type UserInputByPhase = {
  * Describes the type of user input required for a given phase
  */
 export type UserInput<TPhase extends GamePhase> =
-  TPhase extends keyof UserInputByPhase ? UserInputByPhase[TPhase] : unknown;
+  TPhase extends keyof UserInputByPhase ? UserInputByPhase[TPhase] : never;
 
 /**
  * Describes a transition from some game state (in a specific phase) to another,
@@ -216,9 +244,46 @@ export abstract class GameTransition<TFrom extends GamePhase> {
 }
 
 /**
+ * team select/vote failed, advance leader and vote tracker
+ */
+function restartTeamSelect(
+  state: GameStateInPhase<`round:${"team_select" | "team_vote"}`>,
+): GameState {
+  if (state.votesFailed == 4) {
+    return {
+      ...state,
+      phase: "game_over",
+      result: { reason: "vote_tracker", winning_team: "evil" },
+    };
+  }
+  return {
+    ...state,
+    phase: "round:team_select",
+    leaderIndex: (state.leaderIndex + 1) % state.players.length,
+    votesFailed: state.votesFailed + 1,
+  };
+}
+
+/**
  * Describes the flow of the game through transitions from all phases
  */
 export const GAME_FLOW: { [TFrom in GamePhase]: GameTransition<TFrom> } = {
+  /**
+   * Role reveal: all players receive their role assignment + information
+   */
+  role_reveal: {
+    getTargetPlayers(_state): UserId[] {
+      return [];
+    },
+    processInteraction(state, _responses): GameState {
+      return {
+        ...state,
+        phase: "round:team_select",
+        votesFailed: 0,
+      };
+    },
+  },
+
   /**
    * Team selection: the current leader selects a team to go on this mission
    */
@@ -230,10 +295,16 @@ export const GAME_FLOW: { [TFrom in GamePhase]: GameTransition<TFrom> } = {
       state: GameStateInPhase<"round:team_select">,
       responses: Map<UserId, UserId[]>,
     ): GameState {
+      const team = [
+        ...new Set(responses.get(state.players[state.leaderIndex]) ?? []),
+      ].filter((player) => player in state.players);
+      if (team.length != state.config.rounds[state.missionIndex].teamSize) {
+        return restartTeamSelect(state);
+      }
       return {
         ...state,
         phase: "round:team_vote",
-        currentTeam: responses.get(this.getTargetPlayers(state)[0]) ?? [],
+        currentTeam: team,
       };
     },
   },
@@ -248,21 +319,16 @@ export const GAME_FLOW: { [TFrom in GamePhase]: GameTransition<TFrom> } = {
     processInteraction(state, responses): GameState {
       let votes = 0;
       for (const player in state.players) {
-        if (responses.get(player)) {
+        if (responses.get(player) === true) {
           votes++;
         }
       }
-      if (2 * votes > state.players.length) {
-        return {
-          ...state,
-          phase: "round:mission",
-        };
+      if (2 * votes <= state.players.length) {
+        return restartTeamSelect(state);
       }
       return {
         ...state,
-        phase: "round:team_select",
-        leaderIndex: (state.leaderIndex + 1) % state.players.length,
-        votesFailed: state.votesFailed + 1,
+        phase: "round:mission",
       };
     },
   },
@@ -286,12 +352,15 @@ export const GAME_FLOW: { [TFrom in GamePhase]: GameTransition<TFrom> } = {
         }
       }
       // Retrieve the number of fails required from round config
-      const reqFails = state.config.rounds[state.currentMission].reqFail;
+      const reqFails = state.config.rounds[state.missionIndex].reqFail;
       return {
         ...state,
         phase: "round:mission_reveal",
         votes: { success, fail },
-        missionResults: [...state.missionResults, fail >= reqFails],
+        missionResults: [
+          ...state.missionResults,
+          fail < reqFails ? "good" : "evil",
+        ],
       };
     },
   },
@@ -301,46 +370,43 @@ export const GAME_FLOW: { [TFrom in GamePhase]: GameTransition<TFrom> } = {
    */
   "round:mission_reveal": {
     getTargetPlayers(_state): UserId[] {
-      throw Error("not implemented");
+      return [];
     },
-    processInteraction(_state, _responses): GameState {
-      throw Error("not implemented");
-    },
-  },
-
-  /**
-   * Role reveal: all players receive their role assignment + information
-   */
-  role_reveal: {
-    getTargetPlayers(_state): UserId[] {
-      throw Error("not implemented");
-    },
-    processInteraction(_state, _responses): GameState {
-      throw Error("not implemented");
-    },
-  },
-
-  /**
-   * Assassination: the assassin (or all evil players) guess(es) the identity of Merlin
-   */
-  assassination: {
-    getTargetPlayers(_state): UserId[] {
-      throw Error("not implemented");
-    },
-    processInteraction(_state, _responses): GameState {
-      throw Error("not implemented");
-    },
-  },
-
-  /**
-   * Game over: the game ends and results are shown to all players
-   */
-  game_over: {
-    getTargetPlayers(_state): UserId[] {
-      throw Error("not implemented");
-    },
-    processInteraction(_state, _responses): GameState {
-      throw Error("not implemented");
+    processInteraction(state, _responses): GameState {
+      if (state.missionResults.filter((x) => x == "good").length >= 3) {
+        // good team win
+        if (state.config.roles.has("assassin")) {
+          return {
+            ...state,
+            phase: "assassination",
+          };
+        }
+        return {
+          ...state,
+          phase: "game_over",
+          result: { reason: "mission_result", winning_team: "good" },
+        };
+      }
+      if (state.missionResults.filter((x) => x == "evil").length >= 3) {
+        // evil team win
+        return {
+          ...state,
+          phase: "game_over",
+          result: { reason: "mission_result", winning_team: "evil" },
+        };
+      }
+      if (state.config.ladyOfTheLake) {
+        return {
+          ...state,
+          phase: "round:lady_choice",
+        };
+      }
+      return {
+        ...state,
+        phase: "round:team_select",
+        votesFailed: 0,
+        leaderIndex: (state.leaderIndex + 1) % state.players.length,
+      };
     },
   },
 
@@ -365,6 +431,48 @@ export const GAME_FLOW: { [TFrom in GamePhase]: GameTransition<TFrom> } = {
     },
     processInteraction(_state, _responses): GameState {
       throw Error("not implemented");
+    },
+  },
+
+  /**
+   * Assassination: the assassin (or all evil players) guess(es) the identity of Merlin
+   */
+  assassination: {
+    getTargetPlayers(state): UserId[] {
+      return [
+        state.players.filter((player) => state.roles[player] == "assassin")[0],
+      ];
+    },
+    processInteraction(state, responses): GameState {
+      const assassin = state.players.filter(
+        (player) => state.roles[player] == "assassin",
+      )[0];
+      const target = responses.get(assassin);
+      if (typeof target == "string" && state.roles[target] == "merlin") {
+        return {
+          ...state,
+          phase: "game_over",
+          result: { reason: "assassination_result", winning_team: "evil" },
+        };
+      } else {
+        return {
+          ...state,
+          phase: "game_over",
+          result: { reason: "assassination_result", winning_team: "good" },
+        };
+      }
+    },
+  },
+
+  /**
+   * Game over: the game ends and results are shown to all players
+   */
+  game_over: {
+    getTargetPlayers(_state): UserId[] {
+      return [];
+    },
+    processInteraction(state, _responses): GameState {
+      return state;
     },
   },
 };

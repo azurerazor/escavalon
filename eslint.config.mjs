@@ -20,7 +20,7 @@ export default defineConfig([
   {
     rules: {
       "@typescript-eslint/no-unused-vars": [
-        "warn",
+        "error",
         { ignoreRestSiblings: true, argsIgnorePattern: "^_" },
       ],
     },
